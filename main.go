@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -10,38 +11,46 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type SafeSet struct {
 	mu    sync.RWMutex
 	set   map[string]struct{}
 	limit int
+	count int64
 }
 
 func NewSafeSet(limit int) *SafeSet {
 	return &SafeSet{
 		set:   make(map[string]struct{}, limit),
 		limit: limit,
+		count: 0,
 	}
 }
 
 func (s *SafeSet) Add(host string) bool {
+	current := atomic.LoadInt64(&s.count)
+	if int(current) >= s.limit {
+		return true
+	}
+
 	s.mu.Lock()
 	if len(s.set) >= s.limit {
 		s.mu.Unlock()
 		return true
 	}
-	s.set[host] = struct{}{}
+	if _, exists := s.set[host]; !exists {
+		s.set[host] = struct{}{}
+		atomic.AddInt64(&s.count, 1)
+	}
 	limitReached := len(s.set) >= s.limit
 	s.mu.Unlock()
 	return limitReached
 }
 
 func (s *SafeSet) Len() int {
-	s.mu.RLock()
-	l := len(s.set)
-	s.mu.RUnlock()
-	return l
+	return int(atomic.LoadInt64(&s.count))
 }
 
 func (s *SafeSet) Keys() []string {
@@ -470,10 +479,16 @@ func fallbackLabels(p *pattern, limit int) []string {
 	return out
 }
 
-func generateCombinations(p *pattern, results *SafeSet, maxPerPos int) {
+func generateCombinations(ctx context.Context, p *pattern, results *SafeSet, maxPerPos int) {
 	lengths := p.topLengths(5)
 
 	for _, length := range lengths {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		if results.Len() >= results.limit {
 			return
 		}
@@ -491,40 +506,55 @@ func generateCombinations(p *pattern, results *SafeSet, maxPerPos int) {
 
 		var build func(pos int, acc []string)
 		build = func(pos int, acc []string) {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			if results.Len() >= results.limit {
 				return
 			}
 
 			if pos == length {
 				host := strings.Join(acc, ".") + "." + p.base
-				if results.Add(host) {
-					return
-				}
+				results.Add(host)
 				return
 			}
 
 			for _, lbl := range choices[pos] {
-				build(pos+1, append(acc, lbl))
 				if results.Len() >= results.limit {
 					return
 				}
+				build(pos+1, append(acc, lbl))
 			}
 		}
 		build(0, []string{})
 	}
 }
 
-func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, topN int) {
+func generatePermutations(ctx context.Context, p *pattern, hostsChunk []string, results *SafeSet, topN int, maxIter int) {
 	if p.extractor == nil {
 		return
 	}
 
 	ex := p.extractor
+	iterations := 0
 
 	for _, h := range hostsChunk {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		if results.Len() >= results.limit {
 			return
 		}
+		if iterations >= maxIter {
+			return
+		}
+
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -537,27 +567,40 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 		newLabels := make([]string, len(labels))
 
 		for i := 0; i < len(labels); i++ {
+			if results.Len() >= results.limit || iterations >= maxIter {
+				return
+			}
+
 			originalLabel := labels[i]
 			top := p.topLabels(i, topN)
 
 			for _, newLabel := range top {
+				if results.Len() >= results.limit || iterations >= maxIter {
+					return
+				}
 				if newLabel == originalLabel {
 					continue
 				}
 				copy(newLabels, labels)
 				newLabels[i] = newLabel
 				host := strings.Join(newLabels, ".") + "." + p.base
-				if results.Add(host) {
-					return
-				}
+				results.Add(host)
+				iterations++
 			}
 		}
 	}
 
 	for _, h := range hostsChunk {
-		if results.Len() >= results.limit {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if results.Len() >= results.limit || iterations >= maxIter {
 			return
 		}
+
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -569,7 +612,7 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 		labels := strings.Split(sub, ".")
 
 		for i := 0; i < len(labels)-1; i++ {
-			if results.Len() >= results.limit {
+			if results.Len() >= results.limit || iterations >= maxIter {
 				return
 			}
 
@@ -577,6 +620,10 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 
 			separators := []string{"", "-", "_"}
 			for _, sep := range separators {
+				if results.Len() >= results.limit || iterations >= maxIter {
+					return
+				}
+
 				merged := w1 + sep + w2
 				newLabels := make([]string, 0, len(labels)-1)
 				newLabels = append(newLabels, labels[:i]...)
@@ -587,13 +634,16 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 
 				if len(newLabels) > 0 {
 					host := strings.Join(newLabels, ".") + "." + p.base
-					if results.Add(host) {
-						return
-					}
+					results.Add(host)
+					iterations++
 				}
 			}
 
 			for _, sep := range separators {
+				if results.Len() >= results.limit || iterations >= maxIter {
+					return
+				}
+
 				merged := w2 + sep + w1
 				newLabels := make([]string, 0, len(labels)-1)
 				newLabels = append(newLabels, labels[:i]...)
@@ -604,9 +654,8 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 
 				if len(newLabels) > 0 {
 					host := strings.Join(newLabels, ".") + "." + p.base
-					if results.Add(host) {
-						return
-					}
+					results.Add(host)
+					iterations++
 				}
 			}
 		}
@@ -617,22 +666,30 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 
 		for _, env := range ex.environments {
 			for _, svc := range ex.services {
-				if results.Len() >= results.limit {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if results.Len() >= results.limit || iterations >= maxIter {
 					return
 				}
 
 				for _, sep := range separators {
-					combo1 := env + sep + svc
-					host1 := combo1 + "." + p.base
-					if results.Add(host1) {
+					if results.Len() >= results.limit || iterations >= maxIter {
 						return
 					}
 
+					combo1 := env + sep + svc
+					host1 := combo1 + "." + p.base
+					results.Add(host1)
+					iterations++
+
 					combo2 := svc + sep + env
 					host2 := combo2 + "." + p.base
-					if results.Add(host2) {
-						return
-					}
+					results.Add(host2)
+					iterations++
 				}
 			}
 		}
@@ -643,25 +700,41 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 
 		for _, svc := range ex.services {
 			for _, ver := range ex.versions {
-				if results.Len() >= results.limit {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if results.Len() >= results.limit || iterations >= maxIter {
 					return
 				}
 
 				for _, sep := range separators {
-					combo := svc + sep + ver
-					host := combo + "." + p.base
-					if results.Add(host) {
+					if results.Len() >= results.limit || iterations >= maxIter {
 						return
 					}
+
+					combo := svc + sep + ver
+					host := combo + "." + p.base
+					results.Add(host)
+					iterations++
 				}
 			}
 		}
 	}
 
 	for _, h := range hostsChunk {
-		if results.Len() >= results.limit {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if results.Len() >= results.limit || iterations >= maxIter {
 			return
 		}
+
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -682,45 +755,56 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 		}
 
 		for i := 0; i < limit; i++ {
-			if results.Len() >= results.limit {
+			if results.Len() >= results.limit || iterations >= maxIter {
 				return
 			}
+
 			prefix := ex.commonPrefixes[i]
 
 			newLabels := make([]string, 0, len(labels)+1)
 			newLabels = append(newLabels, prefix)
 			newLabels = append(newLabels, labels...)
 			host := strings.Join(newLabels, ".") + "." + p.base
-			if results.Add(host) {
-				return
-			}
+			results.Add(host)
+			iterations++
 
 			for _, sep := range []string{"-", "", "_"} {
+				if results.Len() >= results.limit || iterations >= maxIter {
+					return
+				}
+
 				newFirst := prefix + sep + labels[0]
 				newLabels2 := make([]string, len(labels))
 				copy(newLabels2, labels)
 				newLabels2[0] = newFirst
 				host2 := strings.Join(newLabels2, ".") + "." + p.base
-				if results.Add(host2) {
-					return
-				}
+				results.Add(host2)
+				iterations++
 			}
 		}
 	}
 }
 
-func generateLengthVariations(p *pattern, hostsChunk []string, results *SafeSet, topN int) {
+func generateLengthVariations(ctx context.Context, p *pattern, hostsChunk []string, results *SafeSet, topN int, maxIter int) {
 	knownLengths := make(map[int]bool, len(p.lengths))
 	for l := range p.lengths {
 		knownLengths[l] = true
 	}
 
 	topPrefixes := p.topLabels(0, topN)
+	iterations := 0
 
 	for _, h := range hostsChunk {
-		if results.Len() >= results.limit {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if results.Len() >= results.limit || iterations >= maxIter {
 			return
 		}
+
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -733,22 +817,27 @@ func generateLengthVariations(p *pattern, hostsChunk []string, results *SafeSet,
 		currentLen := len(labels)
 
 		if currentLen > 1 && knownLengths[currentLen-1] {
-			host := strings.Join(labels[1:], ".") + "." + p.base
-			if results.Add(host) {
+			if results.Len() >= results.limit || iterations >= maxIter {
 				return
 			}
+			host := strings.Join(labels[1:], ".") + "." + p.base
+			results.Add(host)
+			iterations++
 		}
 
 		if knownLengths[currentLen+1] {
 			for _, prefix := range topPrefixes {
+				if results.Len() >= results.limit || iterations >= maxIter {
+					return
+				}
+
 				if prefix == labels[0] {
 					continue
 				}
 
 				newHost := prefix + "." + strings.Join(labels, ".") + "." + p.base
-				if results.Add(newHost) {
-					return
-				}
+				results.Add(newHost)
+				iterations++
 			}
 		}
 	}
@@ -768,10 +857,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	const MAX_TOTAL = 2000000
-	const RANGE_LIMIT = 50
-	const TOP_N = 10
-	const MAX_PER_POS = 10
+	const MAX_TOTAL = 1000000
+	const RANGE_LIMIT = 30
+	const TOP_N = 8
+	const MAX_PER_POS = 8
+	const MAX_ITER_PER_WORKER = 50000
 
 	results := NewSafeSet(MAX_TOTAL)
 	for _, h := range hosts {
@@ -784,13 +874,16 @@ func main() {
 	fmt.Fprintln(os.Stderr, "[+] Expandindo padrões numéricos...")
 	expandNumericPatterns(pattern, RANGE_LIMIT)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		fmt.Fprintln(os.Stderr, "[+] Iniciando combinações...")
-		generateCombinations(pattern, results, MAX_PER_POS)
+		generateCombinations(ctx, pattern, results, MAX_PER_POS)
 		fmt.Fprintln(os.Stderr, "[+] Combinações concluídas.")
 	}()
 
@@ -810,15 +903,30 @@ func main() {
 		}
 
 		wg.Add(1)
-		go func(chunk []string) {
+		go func(chunk []string, workerID int) {
 			defer wg.Done()
-			generatePermutations(pattern, chunk, results, TOP_N)
-
+			generatePermutations(ctx, pattern, chunk, results, TOP_N, MAX_ITER_PER_WORKER)
 			if results.Len() < results.limit {
-				generateLengthVariations(pattern, chunk, results, TOP_N)
+				generateLengthVariations(ctx, pattern, chunk, results, TOP_N, MAX_ITER_PER_WORKER)
 			}
-		}(hosts[start:end])
+			fmt.Fprintf(os.Stderr, "[+] Worker %d concluído\n", workerID)
+		}(hosts[start:end], i+1)
 	}
+
+	go func() {
+		for {
+			if results.Len() >= results.limit {
+				fmt.Fprintln(os.Stderr, "[+] Limite atingido, cancelando workers...")
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
 
 	wg.Wait()
 	fmt.Fprintln(os.Stderr, "[+] Todas as tarefas concluídas.")
