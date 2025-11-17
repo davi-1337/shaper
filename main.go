@@ -5,19 +5,63 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime" // Importado para paralelismo
 	"sort"
 	"strconv"
 	"strings"
-	"sync" // Importado para uso futuro, embora não estritamente necessário para esta refatoração
+	"sync" // Importado para paralelismo e SafeSet
 )
 
-// Otimização: Usaremos um pool para strings.Builder para reduzir alocações de memória
-// Embora a concatenação de strings em Go seja otimizada, para geração massiva,
-// um builder pode ser ligeiramente mais eficiente.
-var builderPool = sync.Pool{
-	New: func() interface{} {
-		return &strings.Builder{}
-	},
+// Estrutura de dados segura para concorrência (thread-safe) para armazenar os resultados.
+// Usa um Mutex para proteger o map contra escritas simultâneas.
+type SafeSet struct {
+	mu    sync.Mutex
+	set   map[string]struct{}
+	limit int
+}
+
+// NewSafeSet cria um novo conjunto seguro com um limite.
+func NewSafeSet(limit int) *SafeSet {
+	return &SafeSet{
+		set:   make(map[string]struct{}, limit),
+		limit: limit,
+	}
+}
+
+// Add adiciona um host ao conjunto.
+// Retorna 'true' se o limite foi atingido (seja antes ou depois desta adição).
+func (s *SafeSet) Add(host string) bool {
+	s.mu.Lock()
+	// Verifica o limite *antes* de adicionar, para não estourar o map
+	if len(s.set) >= s.limit {
+		s.mu.Unlock()
+		return true // Limite já atingido
+	}
+
+	s.set[host] = struct{}{}
+	// Verifica se esta adição atingiu o limite
+	limitReached := len(s.set) >= s.limit
+	s.mu.Unlock()
+	return limitReached
+}
+
+// Len retorna o tamanho atual do conjunto de forma segura.
+func (s *SafeSet) Len() int {
+	s.mu.Lock()
+	l := len(s.set)
+	s.mu.Unlock()
+	return l
+}
+
+// Keys retorna uma cópia de todas as chaves (hosts) do conjunto.
+func (s *SafeSet) Keys() []string {
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.set))
+	for k := range s.set {
+		keys = append(keys, k)
+	}
+	s.mu.Unlock()
+	return keys
 }
 
 type pattern struct {
@@ -29,6 +73,7 @@ type pattern struct {
 
 func readLines(path string) ([]string, error) {
 	f, err := os.Open(path)
+	// ... (código existente inalterado) ...
 	if err != nil {
 		return nil, err
 	}
@@ -50,6 +95,7 @@ func readLines(path string) ([]string, error) {
 
 func unique(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
+	// ... (código existente inalterado) ...
 	out := make([]string, 0, len(in))
 	for _, v := range in {
 		if _, ok := seen[v]; ok {
@@ -65,7 +111,7 @@ func guessBase(hosts []string) string {
 	if len(hosts) == 0 {
 		return ""
 	}
-
+	// ... (código existente inalterado) ...
 	suffixCounts := make(map[string]int)
 	for _, h := range hosts {
 		parts := strings.Split(h, ".")
@@ -111,6 +157,7 @@ func guessBase(hosts []string) string {
 func buildPattern(hosts []string) *pattern {
 	base := guessBase(hosts)
 	p := &pattern{
+		// ... (código existente inalterado) ...
 		posFreq:   make(map[int]map[string]int),
 		labelFreq: make(map[string]int),
 		lengths:   make(map[int]int),
@@ -146,7 +193,7 @@ var RE_NUMERIC = regexp.MustCompile(`^([a-zA-Z0-9\-]+?)(\d+)$`)
 
 func expandNumericPatterns(p *pattern, rangeLimit int) {
 	patterns := make(map[int]map[string]map[int][]int)
-
+	// ... (código existente inalterado) ...
 	for pos, labels := range p.posFreq {
 		for lbl := range labels {
 			matches := RE_NUMERIC.FindStringSubmatch(lbl)
@@ -222,6 +269,7 @@ type kv struct {
 }
 
 func (p *pattern) topLabels(pos, limit int) []string {
+	// ... (código existente inalterado) ...
 	freqs, ok := p.posFreq[pos]
 	if !ok {
 		return nil
@@ -242,6 +290,7 @@ func (p *pattern) topLabels(pos, limit int) []string {
 }
 
 func (p *pattern) topLengths(limit int) []int {
+	// ... (código existente inalterado) ...
 	type kvl struct {
 		l int
 		f int
@@ -262,6 +311,7 @@ func (p *pattern) topLengths(limit int) []int {
 }
 
 func fallbackLabels(p *pattern, limit int) []string {
+	// ... (código existente inalterado) ...
 	tmp := make([]kv, 0, len(p.labelFreq))
 	for l, f := range p.labelFreq {
 		tmp = append(tmp, kv{label: l, freq: f})
@@ -277,67 +327,47 @@ func fallbackLabels(p *pattern, limit int) []string {
 	return out
 }
 
-// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
-func generateCombinations(p *pattern, results map[string]struct{}, maxPerPos int, maxTotal int) {
+// OTIMIZAÇÃO: Modificado para usar o SafeSet e parar se o limite for atingido.
+func generateCombinations(p *pattern, results *SafeSet, maxPerPos int) {
 	lengths := p.topLengths(3) // Foca nos 3 comprimentos mais comuns
 
-	// Otimização: Usar um string builder do pool
-	sb := builderPool.Get().(*strings.Builder)
-	defer builderPool.Put(sb)
-
 	for _, length := range lengths {
-		if len(results) >= maxTotal {
+		if results.Len() >= results.limit {
 			return // Para se o limite global foi atingido
 		}
 		if length == 0 {
 			continue
 		}
 		choices := make([][]string, length)
-		totalChoices := 1
+		// ... (código existente inalterado) ...
 		for pos := 0; pos < length; pos++ {
 			tops := p.topLabels(pos, maxPerPos)
 			if len(tops) == 0 {
 				tops = fallbackLabels(p, maxPerPos) // Fallback
 			}
 			choices[pos] = tops
-			if len(tops) > 0 {
-				totalChoices *= len(tops)
-			}
 		}
-
-		// Otimização: Se a combinação deste comprimento for explodir o limite,
-		// podemos pular ou ser mais espertos, mas por enquanto,
-		// a verificação interna da 'build' cuidará disso.
 
 		var build func(pos int, acc []string)
 		build = func(pos int, acc []string) {
 			// Verificação de limite em *cada* chamada recursiva
-			if len(results) >= maxTotal {
+			if results.Len() >= results.limit {
 				return
 			}
 
 			if pos == length {
-				// Usa o string builder para eficiência
-				sb.Reset()
-				for i, lbl := range acc {
-					sb.WriteString(lbl)
-					if i < len(acc)-1 {
-						sb.WriteRune('.')
-					}
+				host := strings.Join(acc, ".") + "." + p.base
+				// Adiciona ao SafeSet; se o limite for atingido, 'return'
+				if results.Add(host) {
+					return
 				}
-				sb.WriteRune('.')
-				sb.WriteString(p.base)
-				host := sb.String()
-
-				results[host] = struct{}{}
 				return
 			}
 
 			for _, lbl := range choices[pos] {
-				// Otimização: a checagem do limite é feita na próxima chamada recursiva
 				build(pos+1, append(acc, lbl))
 				// Se a chamada interna atingiu o limite, paramos este loop também
-				if len(results) >= maxTotal {
+				if results.Len() >= results.limit {
 					return
 				}
 			}
@@ -346,13 +376,11 @@ func generateCombinations(p *pattern, results map[string]struct{}, maxPerPos int
 	}
 }
 
-// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
-func generatePermutations(p *pattern, hosts []string, results map[string]struct{}, topN int, maxTotal int) {
-	sb := builderPool.Get().(*strings.Builder)
-	defer builderPool.Put(sb)
-
-	for _, h := range hosts {
-		if len(results) >= maxTotal {
+// OTIMIZAÇÃO: Modificado para usar o SafeSet e aceitar um "chunk" de hosts.
+func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, topN int) {
+	for _, h := range hostsChunk {
+		// Verificação de limite no início de cada iteração
+		if results.Len() >= results.limit {
 			return // Limite global atingido
 		}
 		if !strings.HasSuffix(h, p.base) {
@@ -375,25 +403,12 @@ func generatePermutations(p *pattern, hosts []string, results map[string]struct{
 					continue
 				}
 
-				// Evita alocação excessiva de 'copy'
 				copy(newLabels, labels)
 				newLabels[i] = newLabel
+				host := strings.Join(newLabels, ".") + "." + p.base
 
-				// Usa o string builder
-				sb.Reset()
-				for j, lbl := range newLabels {
-					sb.WriteString(lbl)
-					if j < len(newLabels)-1 {
-						sb.WriteRune('.')
-					}
-				}
-				sb.WriteRune('.')
-				sb.WriteString(p.base)
-				host := sb.String()
-
-				results[host] = struct{}{}
-
-				if len(results) >= maxTotal {
+				// Adiciona ao SafeSet; se o limite for atingido, para tudo.
+				if results.Add(host) {
 					return // Limite global atingido
 				}
 			}
@@ -401,13 +416,8 @@ func generatePermutations(p *pattern, hosts []string, results map[string]struct{
 	}
 }
 
-// OTIMIZAÇÃO: Removida a função 'generateMultiPermutations'
-// Esta função é a causa de maior explosão combinatória e lentidão,
-// gerando muitos subdomínios de baixa probabilidade.
-// Removê-la aumenta a velocidade e foca em resultados mais "estratégicos".
-
-// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
-func generateLengthVariations(p *pattern, hosts []string, results map[string]struct{}, topN int, maxTotal int) {
+// OTIMIZAÇÃO: Modificado para usar o SafeSet e aceitar um "chunk" de hosts.
+func generateLengthVariations(p *pattern, hostsChunk []string, results *SafeSet, topN int) {
 	knownLengths := make(map[int]bool)
 	for l := range p.lengths {
 		knownLengths[l] = true
@@ -415,11 +425,8 @@ func generateLengthVariations(p *pattern, hosts []string, results map[string]str
 
 	topPrefixes := p.topLabels(0, topN) // Top N labels da *primeira* posição (pos 0)
 
-	sb := builderPool.Get().(*strings.Builder)
-	defer builderPool.Put(sb)
-
-	for _, h := range hosts {
-		if len(results) >= maxTotal {
+	for _, h := range hostsChunk {
+		if results.Len() >= results.limit {
 			return // Limite global
 		}
 		if !strings.HasSuffix(h, p.base) {
@@ -433,47 +440,25 @@ func generateLengthVariations(p *pattern, hosts []string, results map[string]str
 		labels := strings.Split(sub, ".")
 		currentLen := len(labels)
 
-		// 1. Tenta encurtar (ex: de 'a.b.c.base' para 'b.c.base')
-		// Só faz se o comprimento resultante (len-1) for um comprimento conhecido
+		// 1. Tenta encurtar
 		if currentLen > 1 && knownLengths[currentLen-1] {
-			sb.Reset()
-			for i := 1; i < len(labels); i++ { // Começa do índice 1
-				sb.WriteString(labels[i])
-				if i < len(labels)-1 {
-					sb.WriteRune('.')
-				}
-			}
-			sb.WriteRune('.')
-			sb.WriteString(p.base)
-			host := sb.String()
-			results[host] = struct{}{}
-			if len(results) >= maxTotal {
+			// Pula o primeiro label (labels[0])
+			host := strings.Join(labels[1:], ".") + "." + p.base
+			if results.Add(host) {
 				return
 			}
 		}
 
-		// 2. Tenta alongar (ex: de 'b.c.base' para 'PRE.b.c.base')
-		// Só faz se o comprimento resultante (len+1) for um comprimento conhecido
+		// 2. Tenta alongar
 		if knownLengths[currentLen+1] {
 			for _, prefix := range topPrefixes {
 				if prefix == labels[0] { // Evita adicionar o mesmo prefixo
 					continue
 				}
 
-				sb.Reset()
-				sb.WriteString(prefix)
-				sb.WriteRune('.')
-				for i, lbl := range labels {
-					sb.WriteString(lbl)
-					if i < len(labels)-1 {
-						sb.WriteRune('.')
-					}
-				}
-				sb.WriteRune('.')
-				sb.WriteString(p.base)
-				host := sb.String()
-				results[host] = struct{}{}
-				if len(results) >= maxTotal {
+				// Criando host com novo prefixo
+				newHost := prefix + "." + strings.Join(labels, ".") + "." + p.base
+				if results.Add(newHost) {
 					return
 				}
 			}
@@ -481,14 +466,7 @@ func generateLengthVariations(p *pattern, hosts []string, results map[string]str
 	}
 }
 
-// Otimização: Função helper para extrair chaves de map
-func mapKeys(m map[string]struct{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
+// mapKeys agora é obsoleto, pois SafeSet tem seu próprio método Keys()
 
 func main() {
 	if len(os.Args) < 2 {
@@ -502,53 +480,82 @@ func main() {
 		os.Exit(1)
 	}
 
-	// OTIMIZAÇÃO: Limite máximo
 	const MAX_TOTAL = 500000
-
-	// OTIMIZAÇÃO: Parâmetros estratégicos (menos palavras)
-	const RANGE_LIMIT = 20 // Limite para expandir números (ex: web01, web02...)
-	const TOP_N = 5        // Quantas palavras "top" usar para permutações
+	const RANGE_LIMIT = 20 // Limite para expandir números
+	const TOP_N = 5        // Quantas palavras "top" usar
 	const MAX_PER_POS = 5  // Quantas palavras por posição nas combinações
 
-	// OTIMIZAÇÃO: Usar um map para coletar resultados e garantir unicidade
-	results := make(map[string]struct{}, MAX_TOTAL)
+	// OTIMIZAÇÃO: Usar o SafeSet para coletar resultados de forma concorrente
+	results := NewSafeSet(MAX_TOTAL)
 	for _, h := range hosts {
-		results[h] = struct{}{}
+		results.Add(h) // Adiciona a lista inicial
 	}
 
+	fmt.Fprintln(os.Stderr, "[+] Construindo padrão...")
 	pattern := buildPattern(hosts)
 
-	// 1. Expandir padrões numéricos (ex: web01, web02 -> web01..web20)
+	// 1. Expandir padrões numéricos (rápido, pode ser síncrono)
+	fmt.Fprintln(os.Stderr, "[+] Expandindo padrões numéricos...")
 	expandNumericPatterns(pattern, RANGE_LIMIT)
 
-	// 2. Gerar Combinações (ex: [dev,stg] + [web,db] -> dev.web, dev.db, stg.web, stg.db)
-	generateCombinations(pattern, results, MAX_PER_POS, MAX_TOTAL)
-	if len(results) >= MAX_TOTAL {
-		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as combinações.")
+	// OTIMIZAÇÃO: Usar um WaitGroup para gerenciar goroutines
+	var wg sync.WaitGroup
+
+	// 2. Gerar Combinações (em sua própria goroutine)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Fprintln(os.Stderr, "[+] Iniciando combinações (thread 1)...")
+		generateCombinations(pattern, results, MAX_PER_POS)
+		fmt.Fprintln(os.Stderr, "[+] Combinações concluídas.")
+	}()
+
+	// 3. & 4. Gerar Permutações e Variações de Comprimento (em paralelo)
+	numCPU := runtime.NumCPU()
+	if numCPU < 1 {
+		numCPU = 1
+	}
+	// Cálculo para dividir os hosts uniformemente entre as CPUs
+	chunkSize := (len(hosts) + numCPU - 1) / numCPU
+
+	fmt.Fprintf(os.Stderr, "[+] Iniciando permutações e variações (usando %d CPUs)...\n", numCPU)
+
+	for i := 0; i < numCPU; i++ {
+		start := i * chunkSize
+		end := (i + 1) * chunkSize
+		if end > len(hosts) {
+			end = len(hosts)
+		}
+		if start >= end {
+			continue // Sem trabalho para esta goroutine
+		}
+
+		wg.Add(1)
+		go func(chunk []string, workerID int) {
+			defer wg.Done()
+			// fmt.Fprintf(os.Stderr, "[+] Worker %d: Iniciando permutações...\n", workerID)
+			generatePermutations(pattern, chunk, results, TOP_N)
+
+			// Só executa a próxima tarefa se o limite não foi atingido
+			if results.Len() < results.limit {
+				// fmt.Fprintf(os.Stderr, "[+] Worker %d: Iniciando variações de comprimento...\n", workerID)
+				generateLengthVariations(pattern, chunk, results, TOP_N)
+			}
+			// fmt.Fprintf(os.Stderr, "[+] Worker %d: Concluído.\n", workerID)
+		}(hosts[start:end], i+1)
 	}
 
-	// 3. Gerar Permutações (ex: dev.web.base -> stg.web.base, prod.web.base)
-	if len(results) < MAX_TOTAL {
-		generatePermutations(pattern, hosts, results, TOP_N, MAX_TOTAL)
-	}
-	if len(results) >= MAX_TOTAL {
-		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as permutações.")
-	}
+	// Esperar todas as goroutines (Combinações + Workers) terminarem
+	wg.Wait()
+	fmt.Fprintln(os.Stderr, "[+] Todas as tarefas de geração concluídas.")
 
-	// 4. Gerar Variações de Comprimento (ex: a.b.base -> b.base | ex: b.base -> a.b.base)
-	if len(results) < MAX_TOTAL {
-		generateLengthVariations(pattern, hosts, results, TOP_N, MAX_TOTAL)
-	}
-	if len(results) >= MAX_TOTAL {
-		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as variações de comprimento.")
-	}
-
-	// OTIMIZAÇÃO: Não precisamos mais de 'unique(all)',
-	// o map 'results' já cuidou da unicidade.
+	// O SafeSet já cuidou da unicidade.
 	// Apenas precisamos extrair as chaves e ordená-las.
-	finalHosts := mapKeys(results)
+	finalHosts := results.Keys()
+	fmt.Fprintln(os.Stderr, "[+] Ordenando resultados...")
 	sort.Strings(finalHosts)
 
+	// Imprime os resultados
 	for _, h := range finalHosts {
 		fmt.Println(h)
 	}
