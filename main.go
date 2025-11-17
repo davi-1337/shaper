@@ -445,13 +445,13 @@ func mapKeys(m map[string]struct{}) []string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "[-] error uso: shaper input.txt > output.txt")
+		fmt.Fprintln(os.Stderr, "[-] error usage: shaper input.txt > output.txt")
 		os.Exit(1)
 	}
 	in := os.Args[1]
 	hosts, err := readLines(in)
 	if err != nil || len(hosts) == 0 {
-		fmt.Fprintf(os.Stderr, "[-] error lendo %s: %v\n", in, err)
+		fmt.Fprintf(os.Stderr, "[-] error reading %s: %v\n", in, err)
 		os.Exit(1)
 	}
 
