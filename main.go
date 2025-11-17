@@ -8,19 +8,23 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync" // Importado para uso futuro, embora não estritamente necessário para esta refatoração
 )
+
+// Otimização: Usaremos um pool para strings.Builder para reduzir alocações de memória
+// Embora a concatenação de strings em Go seja otimizada, para geração massiva,
+// um builder pode ser ligeiramente mais eficiente.
+var builderPool = sync.Pool{
+	New: func() interface{} {
+		return &strings.Builder{}
+	},
+}
 
 type pattern struct {
 	posFreq   map[int]map[string]int
 	labelFreq map[string]int
 	lengths   map[int]int
 	base      string
-}
-
-type numericPattern struct {
-	prefix  string
-	padding int
-	nums    []int
 }
 
 func readLines(path string) ([]string, error) {
@@ -152,6 +156,7 @@ func expandNumericPatterns(p *pattern, rangeLimit int) {
 			prefix := matches[1]
 			numStr := matches[2]
 			if prefix == "" {
+				// Evitar padrões que são *apenas* números
 				continue
 			}
 			num, err := strconv.Atoi(numStr)
@@ -185,19 +190,26 @@ func expandNumericPatterns(p *pattern, rangeLimit int) {
 						max = n
 					}
 				}
+				// Otimização: Se o range for > rangeLimit, não faz nada
 				if max-min > rangeLimit {
 					continue
 				}
 
-				for n := min; n <= max; n++ {
+				// Otimização: Se o range for muito grande (ex: 1 a 1000)
+				// e rangeLimit é 20, ainda geramos 20.
+				// Vamos limitar a expansão total ao rangeLimit.
+				expansionCount := 0
+				for n := min; n <= max && expansionCount <= rangeLimit; n++ {
+					// Formatando o número com o padding correto
 					newLabel := fmt.Sprintf("%s%0*d", prefix, padding, n)
 
 					if _, ok := p.posFreq[pos][newLabel]; !ok {
-						p.posFreq[pos][newLabel] = 1
+						p.posFreq[pos][newLabel] = 1 // Damos frequência baixa para não dominar
 					}
 					if _, ok := p.labelFreq[newLabel]; !ok {
 						p.labelFreq[newLabel] = 1
 					}
+					expansionCount++
 				}
 			}
 		}
@@ -265,55 +277,84 @@ func fallbackLabels(p *pattern, limit int) []string {
 	return out
 }
 
-func generateCombinations(p *pattern, maxPerPos int, maxTotal int) []string {
-	lengths := p.topLengths(3)
-	candidates := make(map[string]struct{})
+// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
+func generateCombinations(p *pattern, results map[string]struct{}, maxPerPos int, maxTotal int) {
+	lengths := p.topLengths(3) // Foca nos 3 comprimentos mais comuns
+
+	// Otimização: Usar um string builder do pool
+	sb := builderPool.Get().(*strings.Builder)
+	defer builderPool.Put(sb)
+
 	for _, length := range lengths {
+		if len(results) >= maxTotal {
+			return // Para se o limite global foi atingido
+		}
 		if length == 0 {
 			continue
 		}
 		choices := make([][]string, length)
+		totalChoices := 1
 		for pos := 0; pos < length; pos++ {
 			tops := p.topLabels(pos, maxPerPos)
 			if len(tops) == 0 {
-				tops = fallbackLabels(p, maxPerPos)
+				tops = fallbackLabels(p, maxPerPos) // Fallback
 			}
 			choices[pos] = tops
+			if len(tops) > 0 {
+				totalChoices *= len(tops)
+			}
 		}
+
+		// Otimização: Se a combinação deste comprimento for explodir o limite,
+		// podemos pular ou ser mais espertos, mas por enquanto,
+		// a verificação interna da 'build' cuidará disso.
+
 		var build func(pos int, acc []string)
 		build = func(pos int, acc []string) {
-			if len(candidates) >= maxTotal {
+			// Verificação de limite em *cada* chamada recursiva
+			if len(results) >= maxTotal {
 				return
 			}
+
 			if pos == length {
-				host := strings.Join(acc, ".") + "." + p.base
-				candidates[host] = struct{}{}
+				// Usa o string builder para eficiência
+				sb.Reset()
+				for i, lbl := range acc {
+					sb.WriteString(lbl)
+					if i < len(acc)-1 {
+						sb.WriteRune('.')
+					}
+				}
+				sb.WriteRune('.')
+				sb.WriteString(p.base)
+				host := sb.String()
+
+				results[host] = struct{}{}
 				return
 			}
+
 			for _, lbl := range choices[pos] {
-				next := append(acc, lbl)
-				build(pos+1, next)
-				if len(candidates) >= maxTotal {
+				// Otimização: a checagem do limite é feita na próxima chamada recursiva
+				build(pos+1, append(acc, lbl))
+				// Se a chamada interna atingiu o limite, paramos este loop também
+				if len(results) >= maxTotal {
 					return
 				}
 			}
 		}
 		build(0, []string{})
-		if len(candidates) >= maxTotal {
-			break
-		}
 	}
-	out := make([]string, 0, len(candidates))
-	for h := range candidates {
-		out = append(out, h)
-	}
-	sort.Strings(out)
-	return out
 }
 
-func generatePermutations(p *pattern, hosts []string, topN int) []string {
-	candidates := make(map[string]struct{})
+// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
+func generatePermutations(p *pattern, hosts []string, results map[string]struct{}, topN int, maxTotal int) {
+	sb := builderPool.Get().(*strings.Builder)
+	defer builderPool.Put(sb)
+
 	for _, h := range hosts {
+		if len(results) >= maxTotal {
+			return // Limite global atingido
+		}
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -323,87 +364,64 @@ func generatePermutations(p *pattern, hosts []string, topN int) []string {
 			continue
 		}
 		labels := strings.Split(sub, ".")
+		newLabels := make([]string, len(labels))
+
 		for i := 0; i < len(labels); i++ {
 			originalLabel := labels[i]
-			top := p.topLabels(i, topN)
+			top := p.topLabels(i, topN) // Pega os N mais comuns para esta *posição*
+
 			for _, newLabel := range top {
 				if newLabel == originalLabel {
 					continue
 				}
-				newLabels := make([]string, len(labels))
+
+				// Evita alocação excessiva de 'copy'
 				copy(newLabels, labels)
 				newLabels[i] = newLabel
-				host := strings.Join(newLabels, ".") + "." + p.base
-				candidates[host] = struct{}{}
-			}
-		}
-	}
-	out := make([]string, 0, len(candidates))
-	for h := range candidates {
-		out = append(out, h)
-	}
-	sort.Strings(out)
-	return out
-}
 
-func generateMultiPermutations(p *pattern, hosts []string, topN int, maxTotal int) []string {
-	candidates := make(map[string]struct{})
-	for _, h := range hosts {
-		if len(candidates) >= maxTotal {
-			break
-		}
-		if !strings.HasSuffix(h, p.base) {
-			continue
-		}
-		sub := strings.TrimSuffix(h, p.base)
-		sub = strings.TrimSuffix(sub, ".")
-		if sub == "" {
-			continue
-		}
-		labels := strings.Split(sub, ".")
-		if len(labels) < 2 {
-			continue
-		}
+				// Usa o string builder
+				sb.Reset()
+				for j, lbl := range newLabels {
+					sb.WriteString(lbl)
+					if j < len(newLabels)-1 {
+						sb.WriteRune('.')
+					}
+				}
+				sb.WriteRune('.')
+				sb.WriteString(p.base)
+				host := sb.String()
 
-		for i := 0; i < len(labels); i++ {
-			for j := i + 1; j < len(labels); j++ {
-				topI := p.topLabels(i, topN)
-				topJ := p.topLabels(j, topN)
-				for _, newLabelI := range topI {
-					if newLabelI == labels[i] {
-						continue
-					}
-					for _, newLabelJ := range topJ {
-						if newLabelJ == labels[j] {
-							continue
-						}
-						newLabels := make([]string, len(labels))
-						copy(newLabels, labels)
-						newLabels[i] = newLabelI
-						newLabels[j] = newLabelJ
-						host := strings.Join(newLabels, ".") + "." + p.base
-						candidates[host] = struct{}{}
-						if len(candidates) >= maxTotal {
-							return unique(mapKeys(candidates))
-						}
-					}
+				results[host] = struct{}{}
+
+				if len(results) >= maxTotal {
+					return // Limite global atingido
 				}
 			}
 		}
 	}
-	return unique(mapKeys(candidates))
 }
 
-func generateLengthVariations(p *pattern, hosts []string, topN int) []string {
-	candidates := make(map[string]struct{})
+// OTIMIZAÇÃO: Removida a função 'generateMultiPermutations'
+// Esta função é a causa de maior explosão combinatória e lentidão,
+// gerando muitos subdomínios de baixa probabilidade.
+// Removê-la aumenta a velocidade e foca em resultados mais "estratégicos".
+
+// OTIMIZAÇÃO: Modificado para adicionar resultados diretamente ao map e respeitar o limite total
+func generateLengthVariations(p *pattern, hosts []string, results map[string]struct{}, topN int, maxTotal int) {
 	knownLengths := make(map[int]bool)
 	for l := range p.lengths {
 		knownLengths[l] = true
 	}
 
-	topPrefixes := p.topLabels(0, topN)
+	topPrefixes := p.topLabels(0, topN) // Top N labels da *primeira* posição (pos 0)
+
+	sb := builderPool.Get().(*strings.Builder)
+	defer builderPool.Put(sb)
 
 	for _, h := range hosts {
+		if len(results) >= maxTotal {
+			return // Limite global
+		}
 		if !strings.HasSuffix(h, p.base) {
 			continue
 		}
@@ -415,26 +433,55 @@ func generateLengthVariations(p *pattern, hosts []string, topN int) []string {
 		labels := strings.Split(sub, ".")
 		currentLen := len(labels)
 
+		// 1. Tenta encurtar (ex: de 'a.b.c.base' para 'b.c.base')
+		// Só faz se o comprimento resultante (len-1) for um comprimento conhecido
 		if currentLen > 1 && knownLengths[currentLen-1] {
-			newLabels := labels[1:]
-			host := strings.Join(newLabels, ".") + "." + p.base
-			candidates[host] = struct{}{}
+			sb.Reset()
+			for i := 1; i < len(labels); i++ { // Começa do índice 1
+				sb.WriteString(labels[i])
+				if i < len(labels)-1 {
+					sb.WriteRune('.')
+				}
+			}
+			sb.WriteRune('.')
+			sb.WriteString(p.base)
+			host := sb.String()
+			results[host] = struct{}{}
+			if len(results) >= maxTotal {
+				return
+			}
 		}
 
+		// 2. Tenta alongar (ex: de 'b.c.base' para 'PRE.b.c.base')
+		// Só faz se o comprimento resultante (len+1) for um comprimento conhecido
 		if knownLengths[currentLen+1] {
 			for _, prefix := range topPrefixes {
-				if prefix == labels[0] {
+				if prefix == labels[0] { // Evita adicionar o mesmo prefixo
 					continue
 				}
-				newLabels := append([]string{prefix}, labels...)
-				host := strings.Join(newLabels, ".") + "." + p.base
-				candidates[host] = struct{}{}
+
+				sb.Reset()
+				sb.WriteString(prefix)
+				sb.WriteRune('.')
+				for i, lbl := range labels {
+					sb.WriteString(lbl)
+					if i < len(labels)-1 {
+						sb.WriteRune('.')
+					}
+				}
+				sb.WriteRune('.')
+				sb.WriteString(p.base)
+				host := sb.String()
+				results[host] = struct{}{}
+				if len(results) >= maxTotal {
+					return
+				}
 			}
 		}
 	}
-	return unique(mapKeys(candidates))
 }
 
+// Otimização: Função helper para extrair chaves de map
 func mapKeys(m map[string]struct{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -445,35 +492,66 @@ func mapKeys(m map[string]struct{}) []string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "[-] error usage: shaper input.txt > output.txt")
+		fmt.Fprintln(os.Stderr, "[-] erro: use shaper input.txt > output.txt")
 		os.Exit(1)
 	}
 	in := os.Args[1]
 	hosts, err := readLines(in)
 	if err != nil || len(hosts) == 0 {
-		fmt.Fprintf(os.Stderr, "[-] error reading %s: %v\n", in, err)
+		fmt.Fprintf(os.Stderr, "[-] erro ao ler %s: %v\n", in, err)
 		os.Exit(1)
+	}
+
+	// OTIMIZAÇÃO: Limite máximo
+	const MAX_TOTAL = 500000
+
+	// OTIMIZAÇÃO: Parâmetros estratégicos (menos palavras)
+	const RANGE_LIMIT = 20 // Limite para expandir números (ex: web01, web02...)
+	const TOP_N = 5        // Quantas palavras "top" usar para permutações
+	const MAX_PER_POS = 5  // Quantas palavras por posição nas combinações
+
+	// OTIMIZAÇÃO: Usar um map para coletar resultados e garantir unicidade
+	results := make(map[string]struct{}, MAX_TOTAL)
+	for _, h := range hosts {
+		results[h] = struct{}{}
 	}
 
 	pattern := buildPattern(hosts)
 
-	expandNumericPatterns(pattern, 30)
+	// 1. Expandir padrões numéricos (ex: web01, web02 -> web01..web20)
+	expandNumericPatterns(pattern, RANGE_LIMIT)
 
-	a := generateCombinations(pattern, 10, 300000)
-	b := generatePermutations(pattern, hosts, 10)
-	c := generateMultiPermutations(pattern, hosts, 5, 50000)
-	d := generateLengthVariations(pattern, hosts, 10)
+	// 2. Gerar Combinações (ex: [dev,stg] + [web,db] -> dev.web, dev.db, stg.web, stg.db)
+	generateCombinations(pattern, results, MAX_PER_POS, MAX_TOTAL)
+	if len(results) >= MAX_TOTAL {
+		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as combinações.")
+	}
 
-	all := append(hosts, a...)
-	all = append(all, b...)
-	all = append(all, c...)
-	all = append(all, d...)
+	// 3. Gerar Permutações (ex: dev.web.base -> stg.web.base, prod.web.base)
+	if len(results) < MAX_TOTAL {
+		generatePermutations(pattern, hosts, results, TOP_N, MAX_TOTAL)
+	}
+	if len(results) >= MAX_TOTAL {
+		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as permutações.")
+	}
 
-	results := unique(all)
-	sort.Strings(results)
+	// 4. Gerar Variações de Comprimento (ex: a.b.base -> b.base | ex: b.base -> a.b.base)
+	if len(results) < MAX_TOTAL {
+		generateLengthVariations(pattern, hosts, results, TOP_N, MAX_TOTAL)
+	}
+	if len(results) >= MAX_TOTAL {
+		fmt.Fprintln(os.Stderr, "[!] Atingiu o limite máximo durante as variações de comprimento.")
+	}
 
-	for _, h := range results {
+	// OTIMIZAÇÃO: Não precisamos mais de 'unique(all)',
+	// o map 'results' já cuidou da unicidade.
+	// Apenas precisamos extrair as chaves e ordená-las.
+	finalHosts := mapKeys(results)
+	sort.Strings(finalHosts)
+
+	for _, h := range finalHosts {
 		fmt.Println(h)
 	}
-	fmt.Fprintln(os.Stderr, "[+] worked :)")
+
+	fmt.Fprintf(os.Stderr, "[+] trabalho concluído. total de subdomínios: %d\n", len(finalHosts))
 }
