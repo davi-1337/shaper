@@ -69,6 +69,19 @@ type pattern struct {
 	labelFreq map[string]int
 	lengths   map[int]int
 	base      string
+	extractor *PatternExtractor
+}
+
+// PatternExtractor extrai padrões inteligentes dos subdomínios
+type PatternExtractor struct {
+	keywords         map[string]int       // Palavras-chave com frequência
+	separators       map[string]int       // Separadores observados (-, _, "")
+	environments     []string             // dev, staging, prod, test, qa, uat
+	services         []string             // api, app, admin, portal, dashboard
+	versions         []string             // v1, v2, 2023, 2024, etc
+	wordPairs        map[string][]string  // Pares de palavras que aparecem juntas
+	commonPrefixes   []string             // Prefixos mais comuns
+	commonSuffixes   []string             // Sufixos mais comuns
 }
 
 func readLines(path string) ([]string, error) {
@@ -186,7 +199,175 @@ func buildPattern(hosts []string) *pattern {
 			p.labelFreq[lbl]++
 		}
 	}
+
+	// Extrai padrões inteligentes
+	p.extractor = extractPatterns(hosts, p)
 	return p
+}
+
+// extractPatterns analisa os hosts e extrai padrões para permutações criativas
+func extractPatterns(hosts []string, p *pattern) *PatternExtractor {
+	ex := &PatternExtractor{
+		keywords:     make(map[string]int, 500),
+		separators:   make(map[string]int),
+		wordPairs:    make(map[string][]string, 200),
+		environments: []string{},
+		services:     []string{},
+		versions:     []string{},
+	}
+
+	// Categorias conhecidas
+	envKeywords := map[string]bool{
+		"dev": true, "development": true, "staging": true, "stage": true, "stg": true,
+		"prod": true, "production": true, "test": true, "testing": true, "qa": true,
+		"uat": true, "demo": true, "sandbox": true, "preprod": true, "beta": true,
+		"alpha": true, "canary": true, "preview": true, "local": true,
+	}
+
+	serviceKeywords := map[string]bool{
+		"api": true, "app": true, "web": true, "www": true, "admin": true,
+		"portal": true, "dashboard": true, "cdn": true, "static": true, "assets": true,
+		"mail": true, "email": true, "smtp": true, "imap": true, "ftp": true,
+		"vpn": true, "ssh": true, "git": true, "gitlab": true, "jenkins": true,
+		"db": true, "database": true, "redis": true, "mongo": true, "sql": true,
+		"auth": true, "login": true, "sso": true, "oauth": true, "gateway": true,
+		"proxy": true, "lb": true, "loadbalancer": true, "cache": true,
+	}
+
+	versionPattern := regexp.MustCompile(`^v\d+$|^\d{4}$|^v\d+\.\d+$`)
+
+	// Analisa cada label para extrair padrões
+	for _, h := range hosts {
+		if !strings.HasSuffix(h, p.base) {
+			continue
+		}
+		sub := strings.TrimSuffix(h, p.base)
+		sub = strings.TrimSuffix(sub, ".")
+		if sub == "" {
+			continue
+		}
+
+		labels := strings.Split(sub, ".")
+
+		// Analisa cada label
+		for i, lbl := range labels {
+			if lbl == "" {
+				continue
+			}
+
+			// Detecta separadores dentro do label e categoriza as partes
+			if strings.Contains(lbl, "-") {
+				ex.separators["-"]++
+				parts := strings.Split(lbl, "-")
+				for _, part := range parts {
+					if len(part) > 1 {
+						ex.keywords[part]++
+						// Categoriza cada parte
+						if envKeywords[part] {
+							ex.environments = append(ex.environments, part)
+						}
+						if serviceKeywords[part] {
+							ex.services = append(ex.services, part)
+						}
+						if versionPattern.MatchString(part) {
+							ex.versions = append(ex.versions, part)
+						}
+					}
+				}
+				// Rastreia pares
+				if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+					ex.wordPairs[parts[0]] = append(ex.wordPairs[parts[0]], parts[1])
+				}
+			} else if strings.Contains(lbl, "_") {
+				ex.separators["_"]++
+				parts := strings.Split(lbl, "_")
+				for _, part := range parts {
+					if len(part) > 1 {
+						ex.keywords[part]++
+						// Categoriza cada parte
+						if envKeywords[part] {
+							ex.environments = append(ex.environments, part)
+						}
+						if serviceKeywords[part] {
+							ex.services = append(ex.services, part)
+						}
+						if versionPattern.MatchString(part) {
+							ex.versions = append(ex.versions, part)
+						}
+					}
+				}
+				if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+					ex.wordPairs[parts[0]] = append(ex.wordPairs[parts[0]], parts[1])
+				}
+			} else {
+				// Label sem separador
+				ex.separators[""]++
+				ex.keywords[lbl]++
+				// Categoriza o label completo
+				if envKeywords[lbl] {
+					ex.environments = append(ex.environments, lbl)
+				}
+				if serviceKeywords[lbl] {
+					ex.services = append(ex.services, lbl)
+				}
+				if versionPattern.MatchString(lbl) {
+					ex.versions = append(ex.versions, lbl)
+				}
+			}
+
+			// Rastreia pares de labels adjacentes
+			if i > 0 && labels[i-1] != "" {
+				ex.wordPairs[labels[i-1]] = append(ex.wordPairs[labels[i-1]], lbl)
+			}
+		}
+	}
+
+	// Remove duplicatas e mantém apenas os mais frequentes
+	ex.environments = uniqueStrings(ex.environments)
+	ex.services = uniqueStrings(ex.services)
+	ex.versions = uniqueStrings(ex.versions)
+
+	// Extrai prefixos e sufixos mais comuns dos labels
+	ex.extractPrefixesSuffixes(p.labelFreq)
+
+	return ex
+}
+
+func uniqueStrings(input []string) []string {
+	seen := make(map[string]bool)
+	result := []string{}
+	for _, s := range input {
+		if !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func (ex *PatternExtractor) extractPrefixesSuffixes(labelFreq map[string]int) {
+	// Extrai os top N labels como potenciais prefixos/sufixos
+	type kv struct {
+		label string
+		freq  int
+	}
+	items := make([]kv, 0, len(labelFreq))
+	for l, f := range labelFreq {
+		if len(l) >= 2 && f >= 2 { // Mínimo de 2 caracteres e frequência >= 2
+			items = append(items, kv{label: l, freq: f})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].freq > items[j].freq })
+
+	limit := 50
+	if len(items) < limit {
+		limit = len(items)
+	}
+
+	for i := 0; i < limit; i++ {
+		ex.commonPrefixes = append(ex.commonPrefixes, items[i].label)
+		ex.commonSuffixes = append(ex.commonSuffixes, items[i].label)
+	}
 }
 
 var RE_NUMERIC = regexp.MustCompile(`^([a-zA-Z0-9\-]+?)(\d+)$`)
@@ -376,12 +557,28 @@ func generateCombinations(p *pattern, results *SafeSet, maxPerPos int) {
 	}
 }
 
-// OTIMIZAÇÃO: Modificado para usar o SafeSet e aceitar um "chunk" de hosts.
+// OTIMIZAÇÃO: Geração criativa de permutações usando padrões extraídos
+// Esta função implementa 5 estratégias de permutação:
+// 1. Swapping posicional (original): Troca labels por outros comuns na mesma posição
+// 2. Word Concatenation: Mescla labels adjacentes com diferentes separadores (-, _, "")
+//    Exemplos: dev.api → dev-api, devapi, dev_api | api.admin → admin-api, apiadmin
+// 3. Environment + Service: Combina ambientes com serviços de forma inteligente
+//    Exemplos: dev+api → dev-api, api-dev, devapi, apidev
+// 4. Version Combinations: Adiciona versões aos serviços
+//    Exemplos: api+v1 → api-v1, apiv1, api_v1
+// 5. Prefix/Suffix Additions: Adiciona prefixos/sufixos comuns
+//    Exemplos: api → dev-api, staging-api
 func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, topN int) {
+	if p.extractor == nil {
+		return
+	}
+
+	ex := p.extractor
+
+	// 1. Permutações baseadas em swapping (modo original, mas otimizado)
 	for _, h := range hostsChunk {
-		// Verificação de limite no início de cada iteração
 		if results.Len() >= results.limit {
-			return // Limite global atingido
+			return
 		}
 		if !strings.HasSuffix(h, p.base) {
 			continue
@@ -394,22 +591,189 @@ func generatePermutations(p *pattern, hostsChunk []string, results *SafeSet, top
 		labels := strings.Split(sub, ".")
 		newLabels := make([]string, len(labels))
 
+		// Swap com top labels por posição
 		for i := 0; i < len(labels); i++ {
 			originalLabel := labels[i]
-			top := p.topLabels(i, topN) // Pega os N mais comuns para esta *posição*
+			top := p.topLabels(i, topN)
 
 			for _, newLabel := range top {
 				if newLabel == originalLabel {
 					continue
 				}
-
 				copy(newLabels, labels)
 				newLabels[i] = newLabel
 				host := strings.Join(newLabels, ".") + "." + p.base
-
-				// Adiciona ao SafeSet; se o limite for atingido, para tudo.
 				if results.Add(host) {
-					return // Limite global atingido
+					return
+				}
+			}
+		}
+	}
+
+	// 2. NOVO: Word Concatenation - Mescla palavras com diferentes separadores
+	for _, h := range hostsChunk {
+		if results.Len() >= results.limit {
+			return
+		}
+		if !strings.HasSuffix(h, p.base) {
+			continue
+		}
+		sub := strings.TrimSuffix(h, p.base)
+		sub = strings.TrimSuffix(sub, ".")
+		if sub == "" {
+			continue
+		}
+		labels := strings.Split(sub, ".")
+
+		// Para cada label, tenta mesclar com o próximo
+		for i := 0; i < len(labels)-1; i++ {
+			if results.Len() >= results.limit {
+				return
+			}
+
+			w1, w2 := labels[i], labels[i+1]
+
+			// Concatena com diferentes separadores
+			separators := []string{"", "-", "_"}
+			for _, sep := range separators {
+				merged := w1 + sep + w2
+				newLabels := make([]string, 0, len(labels)-1)
+				newLabels = append(newLabels, labels[:i]...)
+				newLabels = append(newLabels, merged)
+				if i+2 < len(labels) {
+					newLabels = append(newLabels, labels[i+2:]...)
+				}
+
+				if len(newLabels) > 0 {
+					host := strings.Join(newLabels, ".") + "." + p.base
+					if results.Add(host) {
+						return
+					}
+				}
+			}
+
+			// Inverte ordem: w2 + sep + w1
+			for _, sep := range separators {
+				merged := w2 + sep + w1
+				newLabels := make([]string, 0, len(labels)-1)
+				newLabels = append(newLabels, labels[:i]...)
+				newLabels = append(newLabels, merged)
+				if i+2 < len(labels) {
+					newLabels = append(newLabels, labels[i+2:]...)
+				}
+
+				if len(newLabels) > 0 {
+					host := strings.Join(newLabels, ".") + "." + p.base
+					if results.Add(host) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 3. NOVO: Environment + Service Combinations
+	// Gera combinações inteligentes tipo: api-prod, dev-admin, staging-portal
+	if len(ex.environments) > 0 && len(ex.services) > 0 {
+		separators := []string{"-", "", "_"}
+
+		for _, env := range ex.environments {
+			for _, svc := range ex.services {
+				if results.Len() >= results.limit {
+					return
+				}
+
+				for _, sep := range separators {
+					// env + sep + svc (ex: dev-api, prodapi)
+					combo1 := env + sep + svc
+					host1 := combo1 + "." + p.base
+					if results.Add(host1) {
+						return
+					}
+
+					// svc + sep + env (ex: api-dev, apiprod)
+					combo2 := svc + sep + env
+					host2 := combo2 + "." + p.base
+					if results.Add(host2) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 4. NOVO: Version Combinations
+	// Gera: api-v1, api-v2, service-2024, etc
+	if len(ex.services) > 0 && len(ex.versions) > 0 {
+		separators := []string{"-", "", "_"}
+
+		for _, svc := range ex.services {
+			for _, ver := range ex.versions {
+				if results.Len() >= results.limit {
+					return
+				}
+
+				for _, sep := range separators {
+					combo := svc + sep + ver
+					host := combo + "." + p.base
+					if results.Add(host) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 5. NOVO: Prefix/Suffix Additions
+	// Adiciona prefixos/sufixos comuns aos labels existentes
+	for _, h := range hostsChunk {
+		if results.Len() >= results.limit {
+			return
+		}
+		if !strings.HasSuffix(h, p.base) {
+			continue
+		}
+		sub := strings.TrimSuffix(h, p.base)
+		sub = strings.TrimSuffix(sub, ".")
+		if sub == "" {
+			continue
+		}
+
+		labels := strings.Split(sub, ".")
+		if len(labels) == 0 {
+			continue
+		}
+
+		// Adiciona prefixos aos primeiros labels (até 3 prefixos)
+		limit := 3
+		if len(ex.commonPrefixes) < limit {
+			limit = len(ex.commonPrefixes)
+		}
+
+		for i := 0; i < limit; i++ {
+			if results.Len() >= results.limit {
+				return
+			}
+			prefix := ex.commonPrefixes[i]
+
+			// Adiciona como novo label no início
+			newLabels := make([]string, 0, len(labels)+1)
+			newLabels = append(newLabels, prefix)
+			newLabels = append(newLabels, labels...)
+			host := strings.Join(newLabels, ".") + "." + p.base
+			if results.Add(host) {
+				return
+			}
+
+			// Concatena com primeiro label
+			for _, sep := range []string{"-", "", "_"} {
+				newFirst := prefix + sep + labels[0]
+				newLabels2 := make([]string, len(labels))
+				copy(newLabels2, labels)
+				newLabels2[0] = newFirst
+				host2 := strings.Join(newLabels2, ".") + "." + p.base
+				if results.Add(host2) {
+					return
 				}
 			}
 		}
