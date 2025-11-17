@@ -1,0 +1,4 @@
+github.com/mb-14/gomarkov v0.0.0-20231120193207-9cbdc8df67a8 h1:4Z2WmWiMrfaZZYbuw5vx1yv1jfgtf5fuRgSUSxhTy5A=
+github.com/mb-14/gomarkov v0.0.0-20231120193207-9cbdc8df67a8/go.mod h1:6nnTLIXjtAZzRGji0HC3vH+rGM2rKdAkIKgizGlRF6g=
+github.com/urfave/cli/v3 v3.6.1 h1:j8Qq8NyUawj/7rTYdBGrxcH7A/j7/G8Q5LhWEW4G3Mo=
+github.com/urfave/cli/v3 v3.6.1/go.mod h1:ysVLtOEmg2tOy6PknnYVhDoouyC/6N42TMeoMzskhso=
